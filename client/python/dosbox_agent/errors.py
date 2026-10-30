@@ -85,7 +85,12 @@ class CursorExpiredError(AgentRpcError):
     pass
 
 
+class StateRevisionMismatchError(AgentRpcError):
+    pass
+
+
 _ERROR_TYPES: dict[str, type[AgentRpcError]] = {
+    "STATE_REVISION_MISMATCH": StateRevisionMismatchError,
     "SESSION_BUSY": SessionBusyError,
     "SESSION_NOT_FOUND": SessionNotFoundError,
     "TARGET_RUNNING": TargetRunningError,

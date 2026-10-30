@@ -2,6 +2,7 @@
 #define DOSBOX_AGENT_DEBUGGER_ADAPTER_H
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,12 @@ struct TraceSample {
     std::string analysis;
 };
 
+struct DisassembledInstruction {
+    MemoryAddress address;
+    std::vector<std::uint8_t> bytes;
+    std::string text;
+};
+
 enum class StepMode {
     Into,
     Over
@@ -87,6 +94,12 @@ public:
                             const std::string& workdir,
                             std::string* error) const;
     bool GetRegisters(RegisterSnapshot* registers, std::string* error) const;
+    bool SetRegisters(const std::map<std::string, std::uint32_t>& values,
+                      RegisterSnapshot* registers, MemoryAccessError* access_error,
+                      std::string* error) const;
+    bool Disassemble(const MemoryAddress& address, std::uint32_t count,
+                     std::vector<DisassembledInstruction>* instructions, MemoryAddress* next,
+                     MemoryAccessError* access_error, std::string* error) const;
     bool Step(StepMode mode, bool* continued, std::string* error) const;
     bool ReadMemory(const MemoryAddress& address,
                     std::size_t length,

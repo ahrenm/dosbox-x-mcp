@@ -106,6 +106,23 @@ static bool GetUnsignedInteger(const JsonValue& value, std::uint32_t* result)
     return true;
 }
 
+static bool GetStateRevision(const JsonValue& value, std::uint64_t* result)
+{
+    if (value.type != JsonType::Number || value.text.empty())
+        return false;
+    std::uint64_t parsed = 0;
+    for (const char character : value.text) {
+        if (character < '0' || character > '9')
+            return false;
+        const std::uint64_t digit = character - '0';
+        if (parsed > ((std::numeric_limits<std::uint64_t>::max)() - digit) / 10u)
+            return false;
+        parsed = parsed * 10u + digit;
+    }
+    *result = parsed;
+    return true;
+}
+
 static bool ParseCursor(const JsonValue* value,
                         const char* prefix,
                         bool* has_cursor,
@@ -448,6 +465,8 @@ static bool IsKnownMethod(const std::string& method)
            method == "execution.step" ||
            method == "execution.wait" ||
            method == "state.get_registers" ||
+           method == "state.set_registers" ||
+           method == "code.disassemble" ||
            method == "memory.read" ||
            method == "memory.write" ||
            method == "breakpoints.create" ||
@@ -608,6 +627,8 @@ public:
                                     const std::string& workdir,
                                     std::string* error) const = 0;
     virtual bool GetRegisters(RegisterSnapshot* registers, std::string* error) const = 0;
+    virtual bool SetRegisters(const std::map<std::string, std::uint32_t>& values, RegisterSnapshot* registers, MemoryAccessError* access_error, std::string* error) const = 0;
+    virtual bool Disassemble(const MemoryAddress& address, std::uint32_t count, std::vector<DisassembledInstruction>* instructions, MemoryAddress* next, MemoryAccessError* access_error, std::string* error) const = 0;
     virtual bool Step(StepMode mode, bool* continued, std::string* error) const = 0;
     virtual bool ReadMemory(const MemoryAddress& address,
                             std::size_t length,
@@ -662,6 +683,8 @@ public:
     AGENT_RUNTIME_FORWARD(Pause, bool Pause(std::string* error) const, (error))
     AGENT_RUNTIME_FORWARD(StartTargetAtEntry, bool StartTargetAtEntry(const std::string& command, const std::vector<std::string>& arguments, const std::string& workdir, std::string* error) const, (command, arguments, workdir, error))
     AGENT_RUNTIME_FORWARD(GetRegisters, bool GetRegisters(RegisterSnapshot* registers, std::string* error) const, (registers, error))
+    AGENT_RUNTIME_FORWARD(SetRegisters, bool SetRegisters(const std::map<std::string, std::uint32_t>& values, RegisterSnapshot* registers, MemoryAccessError* access_error, std::string* error) const, (values, registers, access_error, error))
+    AGENT_RUNTIME_FORWARD(Disassemble, bool Disassemble(const MemoryAddress& address, std::uint32_t count, std::vector<DisassembledInstruction>* instructions, MemoryAddress* next, MemoryAccessError* access_error, std::string* error) const, (address, count, instructions, next, access_error, error))
     AGENT_RUNTIME_FORWARD(Step, bool Step(StepMode mode, bool* continued, std::string* error) const, (mode, continued, error))
     AGENT_RUNTIME_FORWARD(ReadMemory, bool ReadMemory(const MemoryAddress& address, std::size_t length, std::vector<std::uint8_t>* data, MemoryAccessError* access_error, std::string* error) const, (address, length, data, access_error, error))
     AGENT_RUNTIME_FORWARD(WriteMemory, bool WriteMemory(const MemoryAddress& address, const std::vector<std::uint8_t>& data, std::vector<std::uint8_t>* after, MemoryAccessError* access_error, std::string* error) const, (address, data, after, access_error, error))
@@ -715,6 +738,8 @@ public:
 #define AGENT_RUNTIME_UNAVAILABLE(method, signature) \
     signature override { SetUnavailable(error); return false; }
     AGENT_RUNTIME_UNAVAILABLE(GetRegisters, bool GetRegisters(RegisterSnapshot*, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(SetRegisters, bool SetRegisters(const std::map<std::string, std::uint32_t>&, RegisterSnapshot*, MemoryAccessError*, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(Disassemble, bool Disassemble(const MemoryAddress&, std::uint32_t, std::vector<DisassembledInstruction>*, MemoryAddress*, MemoryAccessError*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(Step, bool Step(StepMode, bool*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(ReadMemory, bool ReadMemory(const MemoryAddress&, std::size_t, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(WriteMemory, bool WriteMemory(const MemoryAddress&, const std::vector<std::uint8_t>&, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
@@ -1219,7 +1244,14 @@ static std::string Capabilities(const AgentConfig& config)
     spaces.array.push_back(String("linear"));
     spaces.array.push_back(String("physical"));
     Add(&result, "address_spaces", spaces);
+    JsonValue state = Object();
+    Add(&state, "set_registers", JsonValue::Bool(true));
+    Add(&result, "state", state);
+    JsonValue code = Object();
+    Add(&code, "disassemble", JsonValue::Bool(true));
+    Add(&result, "code", code);
     JsonValue limits = Object();
+    Add(&limits, "max_disassembly_instructions", Number(256));
     Add(&limits, "max_message_bytes", Number(config.max_message_bytes));
     Add(&limits, "max_memory_read_bytes", Number(config.max_memory_read_bytes));
     Add(&limits, "max_trace_events", Number(config.max_trace_events));
@@ -1422,6 +1454,20 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
         std::string capabilities_error;
         if (!AGENT_ParseJson(Capabilities(impl->config), &result, &capabilities_error))
             return AGENT_MakeJsonRpcError(parsed.id, -32603, "Unable to build capabilities response");
+        const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+        if (SubmitEmulationCommandLocked(impl, [impl, operation](const std::uint64_t) {
+                const bool ready = impl->runtime->IsReadyForTargetStart();
+                std::lock_guard<std::mutex> guard(operation->mutex);
+                operation->success = ready;
+                operation->done = true;
+                operation->completed.notify_all();
+            }) == 0)
+            return Error(parsed.id, kErrorCapabilityUnavailable, "Emulation queue unavailable", "CAPABILITY_UNAVAILABLE");
+        lock.unlock();
+        std::unique_lock<std::mutex> guard(operation->mutex);
+        operation->completed.wait_for(guard, std::chrono::milliseconds(impl->config.request_timeout_ms),
+                                     [operation]() { return operation->done; });
+        Add(&result, "ready", JsonValue::Bool(operation->done && operation->success));
         return AGENT_MakeJsonRpcResult(parsed.id, result);
     }
 
@@ -1483,6 +1529,11 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
                                  &target_command, &target_arguments, &validation_error))
             return InvalidParams(parsed.id, validation_error);
 
+        std::vector<NativeBreakpoint> previous_breakpoints;
+        if (impl->session) {
+            for (const auto& breakpoint : impl->session->breakpoints)
+                previous_breakpoints.push_back(breakpoint.second.native);
+        }
         impl->session.reset(new Impl::Session());
         Impl::Session& session = *impl->session;
         session.id = "ses-" + std::to_string(impl->next_session++);
@@ -1527,7 +1578,11 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
             session.deferred_requests[parsed.id_key] = pending;
 
         const std::string workdir = impl->config.dosbox_workdir;
-        if (SubmitEmulationCommandLocked(impl, [impl, session_id, target_command, target_arguments, workdir](const std::uint64_t) {
+        if (SubmitEmulationCommandLocked(impl, [impl, session_id, target_command, target_arguments, workdir, previous_breakpoints](const std::uint64_t) {
+                for (const auto& breakpoint : previous_breakpoints) {
+                    std::string cleanup_error;
+                    impl->runtime->DeleteBreakpoint(breakpoint, &cleanup_error);
+                }
                 StartTargetOnEmulationThread(impl, session_id, target_command, target_arguments, workdir);
             }) == 0) {
             session.state = Impl::SessionState::Failed;
@@ -1754,6 +1809,147 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
                 }
             }
         }
+    } else if (parsed.method == "state.set_registers" || parsed.method == "code.disassemble") {
+        const bool editing = parsed.method == "state.set_registers";
+        std::map<std::string, std::uint32_t> values;
+        std::uint64_t expected = 0;
+        std::uint32_t count = 16;
+        MemoryAddress address;
+        const bool default_address = parsed.params.Find("address") == NULL;
+        std::string validation_error;
+        bool valid = true;
+        if (editing) {
+            const JsonValue* registers = parsed.params.Find("registers");
+            const JsonValue* revision = parsed.params.Find("expected_state_revision");
+            valid = registers && registers->type == JsonType::Object && !registers->object.empty() &&
+                    revision && GetStateRevision(*revision, &expected);
+            if (valid) {
+                for (const auto& entry : registers->object) {
+                    const std::string& name = entry.first;
+                    std::uint32_t value = 0;
+                    if ((name != "eax" && name != "ebx" && name != "ecx" && name != "edx" &&
+                         name != "esi" && name != "edi" && name != "ebp" && name != "esp" &&
+                         name != "eip" && name != "eflags") || !ParseFixedWidthHex(entry.second, 8, &value)) {
+                        valid = false;
+                        break;
+                    }
+                    values[name] = value;
+                }
+            }
+            validation_error = "Nonempty registers map of supported lowercase names and 32-bit hex values, and expected_state_revision are required";
+        } else {
+            const JsonValue* requested_count = parsed.params.Find("instruction_count");
+            valid = (!requested_count || GetUnsignedInteger(*requested_count, &count)) && count >= 1 && count <= 256;
+            if (!default_address)
+                valid = ParseMemoryAddress(parsed.params, "code.disassemble", &address, &validation_error) &&
+                        address.space == MemorySpace::Segmented && valid;
+            if (validation_error.empty())
+                validation_error = "Disassembly requires a segmented address and instruction_count between 1 and 256";
+        }
+        if (!valid) {
+            response = InvalidParams(parsed.id, validation_error);
+        } else if (session->state != Impl::SessionState::Stopped) {
+            response = SessionError(parsed.id, kErrorTargetRunning, "Target must be stopped", "TARGET_RUNNING", session);
+        } else {
+            const auto operation = std::make_shared<Impl::AdapterOperation>();
+            const std::string session_id = session->id;
+            const JsonValue response_id = parsed.id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation, session_id, response_id, editing,
+                                                    values, expected, count, address, default_address](const std::uint64_t) {
+                    // Recheck state and revision at execution time under the session lock.
+                    // Commit the revision here exactly once, including after caller timeout.
+                    std::string answer;
+                    {
+                        std::lock_guard<std::mutex> state_lock(impl->mutex);
+                        if (!impl->session || impl->session->id != session_id) {
+                            answer = Error(response_id, kErrorSessionNotFound, "Session was not found", "SESSION_NOT_FOUND");
+                        } else {
+                            Impl::Session& active = *impl->session;
+                            RegisterSnapshot registers;
+                            MemoryAccessError access_error;
+                            std::string error;
+                            if (active.state != Impl::SessionState::Stopped) {
+                                answer = SessionError(response_id, kErrorTargetRunning, "Target must be stopped", "TARGET_RUNNING", &active);
+                            } else if (editing && active.state_revision != expected) {
+                                answer = SessionError(response_id, -32018, "expected_state_revision does not match", "STATE_REVISION_MISMATCH", &active);
+                            } else if (editing) {
+                                if (!impl->runtime->SetRegisters(values, &registers, &access_error, &error)) {
+                                    if (!access_error.reason.empty()) {
+                                        MemoryAddress current;
+                                        current.segment = active.last_stop_segment;
+                                        current.offset = values.count("eip") ? values.at("eip") : 0;
+                                        answer = AddressError(response_id, error, current, access_error);
+                                    } else {
+                                        answer = InvalidParams(response_id, error.empty() ? "Register update rejected" : error);
+                                    }
+                                } else {
+                                    ++active.state_revision;
+                                    active.last_stop_instruction_pointer = registers.instruction_pointer;
+                                    answer = AGENT_MakeJsonRpcResult(response_id, RegistersResult(registers, active));
+                                }
+                            } else {
+                                MemoryAddress start = address;
+                                if (default_address) {
+                                    if (impl->runtime->GetRegisters(&registers, &error)) {
+                                        start.segment = registers.cs;
+                                        start.offset = registers.instruction_pointer;
+                                    }
+                                }
+                                std::vector<DisassembledInstruction> instructions;
+                                MemoryAddress next;
+                                if (!error.empty() || !impl->runtime->Disassemble(start, count, &instructions, &next, &access_error, &error)) {
+                                    answer = AddressError(response_id, error.empty() ? "Unable to disassemble requested code" : error, start, access_error);
+                                } else {
+                                    JsonValue result = SessionResult(active);
+                                    JsonValue encoded = JsonValue::Array();
+                                    for (const auto& instruction : instructions) {
+                                        JsonValue row = Object();
+                                        Add(&row, "address", EncodeMemoryAddress(instruction.address));
+                                        Add(&row, "data_base64", String(EncodeBase64(instruction.bytes)));
+                                        Add(&row, "length", Number(instruction.bytes.size()));
+                                        Add(&row, "text", String(instruction.text));
+                                        encoded.array.push_back(row);
+                                    }
+                                    Add(&result, "instructions", encoded);
+                                    Add(&result, "next_address", EncodeMemoryAddress(next));
+                                    answer = AGENT_MakeJsonRpcResult(response_id, result);
+                                }
+                            }
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> guard(operation->mutex);
+                        operation->raw_output = answer;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable, "Emulation queue unavailable", "CAPABILITY_UNAVAILABLE");
+            } else {
+                Impl::DeferredRequest pending;
+                pending.request = parsed;
+                pending.fingerprint = parsed.fingerprint;
+                pending.wait = [operation](std::uint32_t timeout) {
+                    std::unique_lock<std::mutex> guard(operation->mutex);
+                    return operation->completed.wait_for(guard, std::chrono::milliseconds(timeout), [operation]() { return operation->done; });
+                };
+                pending.finish = [operation]() { return operation->raw_output; };
+                if (parsed.has_id && parsed.id.type != JsonType::Null)
+                    session->deferred_requests[parsed.id_key] = pending;
+                lock.unlock();
+                const bool completed = pending.wait(impl->config.request_timeout_ms);
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    cache_response = false;
+                    response = Error(parsed.id, kErrorOperationTimeout, "Timed out waiting for debugger operation", "OPERATION_TIMEOUT");
+                } else {
+                    response = pending.finish();
+                    session->deferred_requests.erase(parsed.id_key);
+                }
+            }
+        }
     } else if (parsed.method == "state.get_registers") {
         if (session->state == Impl::SessionState::Running) {
             response = SessionError(parsed.id, kErrorTargetRunning,
@@ -1901,6 +2097,22 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
             if (SubmitEmulationCommandLocked(impl, [impl, session_id, operation_id](const std::uint64_t) {
                     AgentRuntime& adapter = *impl->runtime;
                     std::string adapter_error;
+                    // Session-owned breakpoints must not fire inside DOS cleanup
+                    // or survive into another target using the same PSP memory.
+                    std::vector<NativeBreakpoint> owned_breakpoints;
+                    {
+                        std::lock_guard<std::mutex> cleanup_lock(impl->mutex);
+                        if (!impl->session || impl->session->id != session_id)
+                            return;
+                        for (const auto& breakpoint : impl->session->breakpoints)
+                            owned_breakpoints.push_back(breakpoint.second.native);
+                        impl->session->breakpoints.clear();
+                    }
+                    for (const auto& breakpoint : owned_breakpoints)
+                        adapter.DeleteBreakpoint(breakpoint, &adapter_error);
+                    std::size_t ignored_count = 0;
+                    std::string trace_cleanup_error;
+                    adapter.StopTrace(&ignored_count, &trace_cleanup_error);
                     const bool success = adapter.TerminateTarget(&adapter_error);
                     std::lock_guard<std::mutex> command_lock(impl->mutex);
                     if (!impl->session || impl->session->id != session_id)

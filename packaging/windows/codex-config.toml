@@ -1,0 +1,6 @@
+# Start start-mcp.cmd first. Add this table to your Codex configuration,
+# or run: codex mcp add dosbox --url http://127.0.0.1:8765/mcp
+[mcp_servers.dosbox]
+url = "http://127.0.0.1:8765/mcp"
+startup_timeout_sec = 20
+tool_timeout_sec = 15

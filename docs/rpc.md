@@ -1,5 +1,7 @@
 开发一个 DOSBox-X Debugger Agent Interface，将 DOSBox-X 现有 Debugger 能力封装成 Agent 可调用接口。
 
+Windows MCP access and the backward-compatible register-editing/disassembly extensions are documented in the English [MCP agent guide](mcp-agent-guide.md) and [RPC extension contract](rpc-mcp-extensions.md).
+
 面向 AI Agent 的实际使用流程请先阅读：[DOSBox-X Debugger Agent 使用手册](rpc-agent-usage.md)。
 
 协议契约与验收规范分别见：[rpc-development.md](rpc-development.md)。

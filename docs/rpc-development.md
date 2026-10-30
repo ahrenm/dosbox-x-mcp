@@ -1,5 +1,7 @@
 # DOSBox-X Debugger Agent RPC 开发与验收规范
 
+The subsequent [MCP extension contract](rpc-mcp-extensions.md) adds register editing and structured disassembly to this historical baseline. Its register-editing scope supersedes the exclusion below; other existing RPC contracts remain applicable.
+
 状态：计划基线
 
 版本：v1.0-draft

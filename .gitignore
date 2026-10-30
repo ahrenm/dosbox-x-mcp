@@ -141,3 +141,19 @@ contrib/macos/dosbox-x.plist
 # ignore default dosbox config files (used for manual testing)
 /dosbox-x.conf
 /src/dosbox-x.conf
+/.venv/
+**/__pycache__/
+/client/python/*.egg-info/
+/tests/agent/runtime*/
+/tests/agent/*-build.log
+/tests/agent/*-native.xml
+/tests/agent/mcp-*.env
+!/tests/agent/mcp-example.env
+/tests/agent/mcp-*-results.json
+/tests/agent/mcp-*-results.jsonl
+/tests/agent/mcp-codex-server.log
+/tests/agent/e2e-clean-*/
+/artifacts/
+
+# Local user programs are never part of the source submission.
+/DOSDrive/

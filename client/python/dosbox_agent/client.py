@@ -14,6 +14,8 @@ from typing import Any, Protocol
 from .errors import AgentConnectionError, AgentProtocolError, map_rpc_error
 from .models import (
     AgentConfig,
+    Disassembly,
+    DisassembledInstruction,
     Breakpoint,
     DiagnosticCommandResult,
     MemoryAddress,
@@ -298,6 +300,47 @@ class AgentClient:
         if len(data) != byte_count:
             raise AgentProtocolError("memory.read byte_count does not match data_base64")
         return MemoryRead(MemoryAddress.from_rpc(_object(result, "address")), data, _string(result, "sha256"), _integer(result, "state_revision"))
+
+    def set_registers(self, session_id: str, registers: Mapping[str, str | int], expected_state_revision: int,
+                      request_id: str | None = None) -> RegisterSnapshot:
+        from .models import _hex_argument
+        allowed = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags"}
+        if not registers or not set(registers) <= allowed:
+            raise ValueError("registers must be a nonempty map of supported lowercase register names")
+        if isinstance(expected_state_revision, bool) or not isinstance(expected_state_revision, int) or not 0 <= expected_state_revision <= 0xffffffffffffffff:
+            raise ValueError("expected_state_revision must be an unsigned 64-bit integer")
+        return _registers(self.call("state.set_registers", {
+            "session_id": session_id, "registers": {name: _hex_argument(value, 8) for name, value in registers.items()},
+            "expected_state_revision": expected_state_revision,
+        }, request_id))
+
+    def disassemble(self, session_id: str, address: MemoryAddress | None = None, instruction_count: int = 16,
+                    request_id: str | None = None) -> Disassembly:
+        if isinstance(instruction_count, bool) or not isinstance(instruction_count, int) or not 1 <= instruction_count <= 256:
+            raise ValueError("instruction_count must be between 1 and 256")
+        params: dict[str, Any] = {"session_id": session_id, "instruction_count": instruction_count}
+        if address is not None:
+            if address.space != "segmented":
+                raise ValueError("disassembly requires a segmented address")
+            params["address"] = address.to_rpc()
+        result = self.call("code.disassemble", params, request_id)
+        entries = result.get("instructions")
+        if not isinstance(entries, list):
+            raise AgentProtocolError("disassembly response must contain instructions")
+        instructions = []
+        for entry in entries:
+            entry = _object_value(entry, "instruction")
+            try:
+                data = base64.b64decode(_string(entry, "data_base64"), validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise AgentProtocolError("disassembly returned invalid base64") from error
+            length = _integer(entry, "length")
+            if not 1 <= length <= 15 or len(data) != length:
+                raise AgentProtocolError("disassembly instruction length does not match bytes")
+            instructions.append(DisassembledInstruction(MemoryAddress.from_rpc(_object(entry, "address")), data,
+                                                        length, _string(entry, "text")))
+        return Disassembly(tuple(instructions), MemoryAddress.from_rpc(_object(result, "next_address")),
+                           _integer(result, "state_revision"))
 
     def write_memory(self, session_id: str, address: MemoryAddress, data: bytes, *, expected_sha256: str | None = None,
                      request_id: str | None = None) -> MemoryWrite:

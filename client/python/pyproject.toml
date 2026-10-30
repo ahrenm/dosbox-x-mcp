@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dosbox-agent"
+version = "0.2.0"
+description = "Windows DOSBox-X debugger client and loopback MCP adapter"
+requires-python = ">=3.10"
+dependencies = ["mcp==1.26.0"]
+
+[project.scripts]
+dosbox-mcp = "dosbox_agent.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["dosbox_agent*"]

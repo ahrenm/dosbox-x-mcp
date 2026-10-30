@@ -1,7 +1,9 @@
 #if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
+#include "dosbox.h"
 #include "agent/agent_bridge.h"
 #include "agent/agent_protocol.h"
 #include "agent/agent_server.h"
+#include "agent/debugger_adapter.h"
 
 #include <gtest/gtest.h>
 
@@ -9,6 +11,8 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+
+extern Bitu DasmI386Bytes(char*, const uint8_t*, size_t, uint32_t, bool);
 
 namespace {
 
@@ -250,7 +254,7 @@ TEST(AgentSession, BlocksStateOperationsWhileRunningAndWaitsForPause)
     EXPECT_NE(std::string::npos, server.HandleJsonRpc(
             "{\"jsonrpc\":\"2.0\",\"id\":\"registers\",\"method\":\"state.get_registers\",\"params\":{\"session_id\":\"ses-1\"}}").find("TARGET_RUNNING"));
     EXPECT_NE(std::string::npos, server.HandleJsonRpc(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"read\",\"method\":\"memory.read\",\"params\":{\"session_id\":\"ses-1\"}}").find("TARGET_RUNNING"));
+            "{\"jsonrpc\":\"2.0\",\"id\":\"read\",\"method\":\"memory.read\",\"params\":{\"session_id\":\"ses-1\",\"address\":{\"space\":\"physical\",\"offset\":\"0x00000000\"},\"length\":1}}").find("TARGET_RUNNING"));
     EXPECT_NE(std::string::npos, server.HandleJsonRpc(
             "{\"jsonrpc\":\"2.0\",\"id\":\"write\",\"method\":\"memory.write\",\"params\":{\"session_id\":\"ses-1\"}}").find("TARGET_RUNNING"));
 
@@ -282,6 +286,51 @@ TEST(AgentSession, ReusesCompletedRequestResultsAndRejectsConflicts)
     const std::string conflict = server.HandleJsonRpc(
             "{\"jsonrpc\":\"2.0\",\"id\":\"operation\",\"method\":\"execution.pause\",\"params\":{\"session_id\":\"ses-1\"}}");
     EXPECT_NE(std::string::npos, conflict.find("REQUEST_ID_CONFLICT"));
+}
+
+TEST(AgentRegisters, RejectsInvalidNamesAndStaleRevisionsBeforeMutation)
+{
+    dosbox_agent::AgentServer server;
+    std::string error;
+    ASSERT_TRUE(server.StartForTest(MakeTestConfig(), &error)) << error;
+    StartFixtureSession(&server);
+    const std::string invalid = server.HandleJsonRpc(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"invalid\",\"method\":\"state.set_registers\","
+            "\"params\":{\"session_id\":\"ses-1\",\"registers\":{\"eax\":\"0x00000001\",\"cr0\":\"0x00000000\"},\"expected_state_revision\":1}}");
+    EXPECT_NE(std::string::npos, invalid.find("-32602"));
+    const std::string stale = server.HandleJsonRpc(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"stale\",\"method\":\"state.set_registers\","
+            "\"params\":{\"session_id\":\"ses-1\",\"registers\":{\"eax\":\"0x00000001\"},\"expected_state_revision\":0}}");
+    EXPECT_NE(std::string::npos, stale.find("STATE_REVISION_MISMATCH"));
+    const std::string status = server.HandleJsonRpc(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"status\",\"method\":\"session.status\",\"params\":{\"session_id\":\"ses-1\"}}");
+    EXPECT_NE(std::string::npos, status.find("\"state_revision\":1"));
+}
+
+TEST(AgentDisassembly, ValidatesCountAndAddressSpace)
+{
+    dosbox_agent::AgentServer server;
+    std::string error;
+    ASSERT_TRUE(server.StartForTest(MakeTestConfig(), &error)) << error;
+    StartFixtureSession(&server);
+    EXPECT_NE(std::string::npos, server.HandleJsonRpc(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"count\",\"method\":\"code.disassemble\","
+            "\"params\":{\"session_id\":\"ses-1\",\"instruction_count\":257}}").find("-32602"));
+    EXPECT_NE(std::string::npos, server.HandleJsonRpc(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"address\",\"method\":\"code.disassemble\","
+            "\"params\":{\"session_id\":\"ses-1\",\"address\":{\"space\":\"physical\",\"offset\":\"0x00000000\"}}}").find("-32602"));
+}
+
+TEST(AgentDisassembly, NativeDecoderUsesOnlySuppliedBytesAndMode)
+{
+    char text[512] = {};
+    const uint8_t instruction[] = {0xb8, 0x34, 0x12, 0x78, 0x56};
+    EXPECT_EQ(0U, DasmI386Bytes(text, instruction, 2, 0x100, false));
+    EXPECT_EQ(3U, DasmI386Bytes(text, instruction, 3, 0x100, false));
+    EXPECT_EQ(0U, DasmI386Bytes(text, instruction, 3, 0x100, true));
+    EXPECT_EQ(5U, DasmI386Bytes(text, instruction, 5, 0x100, true));
+    const uint8_t prefixes[15] = {0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66};
+    EXPECT_EQ(0U, DasmI386Bytes(text, prefixes, 15, 0x100, false));
 }
 
 } // namespace

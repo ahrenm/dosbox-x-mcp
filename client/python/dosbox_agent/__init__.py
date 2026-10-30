@@ -5,6 +5,7 @@ from .errors import (
     AgentError,
     AgentProtocolError,
     AgentRpcError,
+    StateRevisionMismatchError,
     BreakpointNotFoundError,
     CapabilityUnavailableError,
     CommandRejectedError,
@@ -22,6 +23,8 @@ from .errors import (
 )
 from .models import (
     AgentConfig,
+    Disassembly,
+    DisassembledInstruction,
     Breakpoint,
     DiagnosticCommandResult,
     MemoryAddress,
@@ -39,6 +42,7 @@ from .models import (
 )
 
 __all__ = [
+    "Disassembly", "DisassembledInstruction", "StateRevisionMismatchError",
     "AddressNotMappedError", "AgentClient", "AgentConfig", "AgentConnectionError", "AgentError",
     "AgentProtocolError", "AgentRpcError", "Breakpoint", "BreakpointNotFoundError",
     "CapabilityUnavailableError", "CommandRejectedError", "CursorExpiredError", "DiagnosticCommandResult",

@@ -196,3 +196,18 @@ class DiagnosticCommandResult:
     parse_status: str
     parsed_registers: Mapping[str, str] | None
     unparsed_output: str | None
+
+
+@dataclass(frozen=True)
+class DisassembledInstruction:
+    address: MemoryAddress
+    data: bytes
+    length: int
+    text: str
+
+
+@dataclass(frozen=True)
+class Disassembly:
+    instructions: tuple[DisassembledInstruction, ...]
+    next_address: MemoryAddress
+    state_revision: int

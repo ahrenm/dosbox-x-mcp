@@ -656,8 +656,22 @@ static char *addr_to_hex(UINT32 addr, int splitup) {
 static PhysPt getbyte_mac;
 static PhysPt startPtr;
 
+// Structured debugger callers supply checked, mode-aware bytes. The legacy
+// memory-backed entry point remains unchanged when this pointer is null.
+static const uint8_t* checked_bytes = NULL;
+static size_t checked_byte_count = 0;
+static bool checked_bytes_exhausted = false;
+
 static UINT8 getbyte(void) {
     uint8_t c;
+
+    if (checked_bytes != NULL) {
+        const size_t index = getbyte_mac++;
+        if (index < checked_byte_count)
+            return checked_bytes[index];
+        checked_bytes_exhausted = true;
+        return 0; // Terminates prefix decoding even for truncated input.
+    }
 
 	if (!mem_readb_checked(getbyte_mac++,&c))
         return c;
@@ -1354,6 +1368,18 @@ Bitu DasmI386(char* buffer, PhysPt pc, uint32_t cur_ip, bool bit32)
 	}
 
 	return getbyte_mac-pc;
+}
+
+// Zero means more input is required. Never reads guest memory through this API.
+Bitu DasmI386Bytes(char* buffer, const uint8_t* bytes, size_t count, uint32_t cur_ip, bool bit32)
+{
+    checked_bytes = bytes;
+    checked_byte_count = count;
+    checked_bytes_exhausted = false;
+    const Bitu length = DasmI386(buffer, 0, cur_ip, bit32);
+    const bool exhausted = checked_bytes_exhausted;
+    checked_bytes = NULL;
+    return exhausted ? 0 : length;
 }
 
 int DasmLastOperandSize()

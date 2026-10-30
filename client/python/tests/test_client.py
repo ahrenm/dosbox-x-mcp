@@ -219,6 +219,25 @@ class AgentClientTests(unittest.TestCase):
         self.assertEqual(["write-once", "write-once"], [request["id"] for request in write_requests])
         self.assertEqual(base64.b64encode(b"\xDE\xAD").decode("ascii"), write_requests[0]["params"]["data_base64"])
 
+    def test_register_edit_and_disassembly_models(self):
+        def handler(request):
+            if request["method"] == "state.set_registers":
+                return {"result": registers_result(4)}
+            return {"result": {"instructions": [{"address": {"space": "segmented", "segment": "0x0812", "offset": "0x00000100"},
+                              "data_base64": "uDQS", "length": 3, "text": "mov ax,1234"}],
+                              "next_address": {"space": "segmented", "segment": "0x0812", "offset": "0x00000103"}, "state_revision": 4}}
+        transport = FakeTransport(handler)
+        client = AgentClient(make_config(), transport)
+        self.assertEqual(client.set_registers("ses-1", {"eax": 1}, 3).state_revision, 4)
+        self.assertEqual(transport.requests[0]["params"]["registers"], {"eax": "0x00000001"})
+        result = client.disassemble("ses-1", instruction_count=1)
+        self.assertEqual(result.instructions[0].data, b"\xb8\x34\x12")
+        self.assertEqual(result.next_address.offset, "0x00000103")
+        with self.assertRaises(ValueError):
+            client.set_registers("ses-1", {}, 3)
+        with self.assertRaises(ValueError):
+            client.disassemble("ses-1", instruction_count=257)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,8 @@ def main() -> int:
         raise RuntimeError(f"DOSBox-X executable was not found: {client.config.dosbox_executable}")
 
     process = subprocess.Popen(
-        [str(client.config.dosbox_executable), "--agent-config", str(config_path)],
+        [str(client.config.dosbox_executable), "--agent-config", str(config_path),
+         "-defaultconf", "-fastlaunch", "-set", "sdl waitonerror=false"],
         cwd=REPOSITORY_ROOT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )

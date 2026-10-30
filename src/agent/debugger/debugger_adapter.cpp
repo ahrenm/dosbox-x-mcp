@@ -11,6 +11,8 @@
 #include "paging.h"
 #include "shell.h"
 
+extern Bitu DasmI386Bytes(char*, const uint8_t*, size_t, uint32_t, bool);
+
 extern bool ParseCommand(char* str);
 extern char appname[];
 extern char appargs[];
@@ -61,6 +63,15 @@ bool IsReadOnlyDiagnosticCommand(const std::string& command)
 }
 
 #if C_DEBUG
+// DOS shell execution context, captured before DEBUGBOX enters the target.
+// Forced termination of an extender must restore DOS addressing before PSP cleanup.
+CPUBlock launch_cpu;
+Segments launch_segments;
+Bitu launch_cr0 = 0;
+Bitu launch_cr3 = 0;
+Bitu launch_cr4 = 0;
+bool have_launch_context = false;
+
 bool ResolveSegmentedByte(const MemoryAddress& address,
                           const std::size_t index,
                           std::uint32_t* linear,
@@ -76,6 +87,20 @@ bool ResolveSegmentedByte(const MemoryAddress& address,
     if (!cpu.pmode || (reg_flags & FLAG_VM)) {
         offset &= 0xffffu;
         *linear = (static_cast<std::uint32_t>(address.segment) << 4u) + offset;
+        return true;
+    }
+
+    if (address.segment == SegValue(cs)) {
+        if (offset > SegLimit(cs) || (!cpu.code.big && offset > 0xffffu)) {
+            SetAccessError(access_error, "segment_limit", offset);
+            return false;
+        }
+        const std::uint64_t resolved = static_cast<std::uint64_t>(SegPhys(cs)) + offset;
+        if (resolved > 0xffffffffu) {
+            SetAccessError(access_error, "address_overflow", offset);
+            return false;
+        }
+        *linear = static_cast<std::uint32_t>(resolved);
         return true;
     }
 
@@ -332,6 +357,12 @@ bool DebuggerAdapter::StartTargetAtEntry(const std::string& command,
     for (std::vector<std::string>::const_iterator it = arguments.begin(); it != arguments.end(); ++it)
         debugbox_command += " " + *it;
     dos.errorcode = 0;
+    launch_cpu = cpu;
+    launch_segments = Segs;
+    launch_cr0 = CPU_GET_CRX(0);
+    launch_cr3 = CPU_GET_CRX(3);
+    launch_cr4 = CPU_GET_CRX(4);
+    have_launch_context = true;
     first_shell->DoCommand(&debugbox_command[0]);
     if (dos.errorcode != 0) {
         if (error != NULL)
@@ -370,6 +401,121 @@ bool DebuggerAdapter::GetRegisters(RegisterSnapshot* registers, std::string* err
     registers->instruction_pointer = reg_eip;
     registers->flags = static_cast<std::uint32_t>(reg_flags);
     registers->cpu_mode = !cpu.pmode ? "real" : ((reg_flags & FLAG_VM) ? "v86" : "protected");
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::SetRegisters(const std::map<std::string, std::uint32_t>& values,
+                                   RegisterSnapshot* registers, MemoryAccessError* access_error,
+                                   std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || values.empty())
+        return false;
+#if C_DEBUG
+    const std::uint32_t flag_mask = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF |
+                                    FLAG_TF | FLAG_IF | FLAG_DF | FLAG_OF;
+    // Validate the whole transaction before touching any register.
+    for (const auto& entry : values) {
+        const std::string& name = entry.first;
+        if (name != "eax" && name != "ebx" && name != "ecx" && name != "edx" &&
+            name != "esi" && name != "edi" && name != "ebp" && name != "esp" &&
+            name != "eip" && name != "eflags") {
+            *error = "Unsupported register";
+            return false;
+        }
+        if (name == "eflags" && ((entry.second ^ reg_flags) & ~flag_mask)) {
+            *error = "EFLAGS changes include protected bits";
+            return false;
+        }
+        if (name == "eip") {
+            const std::uint32_t limit = (!cpu.pmode || (reg_flags & FLAG_VM)) ? 0xffffu : SegLimit(cs);
+            if (entry.second > limit || (!cpu.code.big && entry.second > 0xffffu)) {
+                SetAccessError(access_error, "segment_limit", entry.second);
+                *error = "EIP exceeds the current code segment or execution mode";
+                return false;
+            }
+        }
+    }
+    for (const auto& entry : values) {
+        const auto value = entry.second;
+        if (entry.first == "eax") reg_eax = value;
+        else if (entry.first == "ebx") reg_ebx = value;
+        else if (entry.first == "ecx") reg_ecx = value;
+        else if (entry.first == "edx") reg_edx = value;
+        else if (entry.first == "esi") reg_esi = value;
+        else if (entry.first == "edi") reg_edi = value;
+        else if (entry.first == "ebp") reg_ebp = value;
+        else if (entry.first == "esp") reg_esp = value;
+        else if (entry.first == "eip") reg_eip = value;
+        else if (entry.first == "eflags") CPU_SetFlags(value, flag_mask);
+    }
+    return GetRegisters(registers, error);
+#else
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::Disassemble(const MemoryAddress& address, const std::uint32_t count,
+                                  std::vector<DisassembledInstruction>* instructions, MemoryAddress* next,
+                                  MemoryAccessError* access_error, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || count == 0 || count > 256 ||
+        address.space != MemorySpace::Segmented)
+        return false;
+#if C_DEBUG
+    bool big = false;
+    std::uint32_t limit = 0xffffu;
+    if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+        if (address.segment == SegValue(cs)) {
+            big = cpu.code.big;
+            limit = SegLimit(cs);
+        } else {
+            Descriptor descriptor;
+            if (!cpu.gdt.GetDescriptor(address.segment, descriptor) || !descriptor.saved.seg.p ||
+                (descriptor.Type() & 0x18u) != 0x18u) {
+                SetAccessError(access_error, "invalid_selector", address.offset);
+                return false;
+            }
+            big = descriptor.Big();
+            limit = static_cast<std::uint32_t>(descriptor.GetLimit());
+        }
+    }
+    instructions->clear();
+    *next = address;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        DisassembledInstruction instruction;
+        instruction.address = *next;
+        Bitu length = 0;
+        char text[512] = {};
+        for (std::size_t byte = 0; byte < 15; ++byte) {
+            const std::uint64_t offset = static_cast<std::uint64_t>(next->offset) + byte;
+            if (offset > limit || (!big && offset > 0xffffu)) {
+                SetAccessError(access_error, "segment_limit", static_cast<std::uint32_t>(offset));
+                return false;
+            }
+            MemoryAddress at = *next;
+            at.offset = static_cast<std::uint32_t>(offset);
+            std::vector<std::uint8_t> data;
+            if (!ReadMemory(at, 1, &data, access_error, error))
+                return false;
+            instruction.bytes.push_back(data[0]);
+            length = DasmI386Bytes(text, instruction.bytes.data(), instruction.bytes.size(), next->offset, big);
+            if (length != 0)
+                break;
+        }
+        if (length == 0 || length > 15) {
+            SetAccessError(access_error, "instruction_too_long", next->offset);
+            return false;
+        }
+        instruction.bytes.resize(length);
+        instruction.text = text;
+        instructions->push_back(instruction);
+        const std::uint64_t following = static_cast<std::uint64_t>(next->offset) + length;
+        // Real-mode/16-bit IP wraps only between complete instructions.
+        next->offset = big ? static_cast<std::uint32_t>(following) : static_cast<std::uint32_t>(following & 0xffffu);
+    }
     return true;
 #else
     return false;
@@ -709,6 +855,19 @@ bool DebuggerAdapter::TerminateTarget(std::string* error) const
         return false;
 
 #if C_DEBUG
+    if (have_launch_context && (cpu.pmode || (reg_flags & FLAG_VM))) {
+        CPU_SET_CRX(0, launch_cr0);
+        CPU_SET_CRX(3, launch_cr3);
+        CPU_SET_CRX(4, launch_cr4);
+        cpu.cpl = launch_cpu.cpl;
+        cpu.mpl = launch_cpu.mpl;
+        cpu.gdt = launch_cpu.gdt;
+        cpu.idt = launch_cpu.idt;
+        cpu.code = launch_cpu.code;
+        cpu.stack = launch_cpu.stack;
+        Segs = launch_segments;
+        CPU_SetFlags(0, FLAG_VM | FLAG_NT);
+    }
     DOS_Terminate(dos.psp(), false, 0);
 
     // Keep the externally initiated exit equivalent to DOS INT 21h/AH=4Ch.
